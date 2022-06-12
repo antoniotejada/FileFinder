@@ -39,13 +39,15 @@ on Linux,
 - Uses PyQt5
 - Works on Raspberry Pi 3 with LXDE
 - Works on Windows
+- On demand row displaying/virtual table for efficency (but note that
+  directories are still loaded wholesome at startup, just dispalyed on demand as
+  the table is scrolled to prevent QTableView building startup time)
 - Launch associated applications on doubleclick/enter
 - Copy full path to clipboard on right click
 
 ## Todo
-- Filling the table is slow, should use virtual tables
-- Filtering is slow, needs indexing
-- Sorting is slow, needs indexing
+- Filtering could be faster, needs indexing
+- Sorting could be faster, needs indexing
 - Fetching files is slow, needs storing directory data to disk and doing periodic smart updates
 - More keyboard shortcuts (delete, go to search box, etc)
 - Installation instructions/requirements.txt

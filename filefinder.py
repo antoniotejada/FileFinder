@@ -43,7 +43,8 @@ def get_entries_qt_dirit(dirpath, recurse = True):
         entry = d.fileInfo()
         if (entry.isDir()):
             if (recurse):
-                entries.extend(get_entries_qt_dirit(entry.filePath()))
+                # QT uses forward slashes, normalize
+                entries.extend(get_entries_qt_dirit(os.path.normpath(entry.filePath())))
 
         else:
             entries.append((entry.fileName(), dirpath, entry.size(), entry.lastModified()))
@@ -67,20 +68,103 @@ def launch_with_preferred_app(filepath):
 
 
 class TableModel(QAbstractTableModel):
+
     def __init__(self, data, headers):
         super(TableModel, self).__init__()
         self.data = data
         self.headers = headers
+        self.filter_words = []
+        self.last_sort_section_order = (None, None)
+        self.reset()
+        assert len(self.headers) == len(self.data[0])
 
     def data(self, ix, role):
         if (role == Qt.DisplayRole):
-            return self.data[ix.row()][ix.column()]
+            ## print "data", ix.row(), ix.column()
+            return self.data[self.filtered_rows[ix.row()]][ix.column()]
 
-    def rowCount(self, ix):
+    def filteredRowCount(self):
+        return self.filtered_row_count
+
+    def loadedRowCount(self):
+        return self.loaded_row_count
+
+    def totalRowCount(self):
         return len(self.data)
 
+    def canFetchMore(self, index):
+        print "canFetchMore", self.loaded_row_count, len(self.data)
+        if (index.isValid()):
+            return False
+        
+        return self.loaded_row_count < len(self.data)
+
+    def internalGetFilepath(self, row):
+        filename = self.data[row][0]
+        dirpath = self.data[row][1]
+    
+        filepath = os.path.join(dirpath, filename)
+
+        return filepath
+        
+
+    def filterMoreRows(self, count):
+        # Find how many filtered in rows there are
+        loaded_row_count = self.loaded_row_count
+        filtered_row_count = self.filtered_row_count
+        while ((loaded_row_count < len(self.data)) and 
+                ((filtered_row_count - self.filtered_row_count) < count)):
+            
+            # Note this needs to access the data without any remapping, since
+            # it's used to check if this row will be filtered out or not below,
+            # and the remapping array filtered_rows won't be setup until it's
+            # known this row is not filtered out
+            filepath = self.internalGetFilepath(loaded_row_count)
+            # Do case-insensitive by default by comparing lowercase
+            filepath = filepath.lower()
+
+            if ((len(self.filter_words) == 0) or
+                all([filter_word in filepath for filter_word in self.filter_words])):
+                self.filtered_rows.append(loaded_row_count)
+                filtered_row_count += 1
+
+            loaded_row_count += 1
+
+        self.loaded_row_count = loaded_row_count
+        self.filtered_row_count = filtered_row_count
+
+
+    def fetchMore(self, index):
+        print "fetchMore", self.loaded_row_count, len(self.data)
+        if (index.isValid()):
+            return False
+
+        filtered_row_count = self.filtered_row_count
+
+        self.filterMoreRows(25)
+
+        self.beginInsertRows(index, filtered_row_count, self.filtered_row_count - 1)
+        self.endInsertRows()
+        
+
+    def rowCount(self, index):
+        if (index.isValid()):
+            return 0
+
+        assert self.filtered_row_count == len(self.filtered_rows)
+
+        # Returning the currently loaded and filtered count causes the vertical
+        # scroll bar position to change as new entries are loaded. This is not
+        # ideal, would like to return the total count here in order to have a
+        # stable vertical scroll bar, but that's not possible with on-demand row
+        # loading via canFetchMore/fetchMore. An option would be to move on
+        # demand loading to the data() method, but if resizeColumnsToContents()
+        # is used, QT will traverse the full rowCount to find the content to 
+        # resize to
+        return self.filtered_row_count
+
     def columnCount(self, ix):
-        return len(self.data[0])
+        return len(self.headers)
 
     def headerData(self, section, orientation, role):
         if (role == Qt.DisplayRole):
@@ -89,41 +173,52 @@ class TableModel(QAbstractTableModel):
         return None
 
     def getFilepath(self, ix):
-        filename = ix.sibling(ix.row(), 0).data()
-        dirpath = ix.sibling(ix.row(), 1).data()
-    
-        # os.path.join uses backslash, needs normalizing to forward to match
-        # what QDirIterator produces
-        filepath = os.path.normpath(os.path.join(dirpath, filename))
-
-        return filepath
+        return self.internalGetFilepath(self.filtered_rows[ix.row()])
         
-
-class SortFilterProxyModel(QSortFilterProxyModel):
-    def __init__(self, *args, **kwargs):
-        super(SortFilterProxyModel, self).__init__(*args, **kwargs)
-        self.filter_words = []
+    def reset(self):
+        self.loaded_row_count = 0
+        self.filtered_row_count = 0
+        self.filtered_rows = []
 
     def setFilter(self, filter):
         # Do case-insensitive by default by comparing lowercase
         self.filter_words = filter.lower().split()
-        self.invalidateFilter()
+        self.beginResetModel()
+        self.reset()
+        self.endResetModel()
 
-    def filterAcceptsRow(self, source_row, source_parent):
+    def sort(self, section, sort_order):
+        print "sort", section, sort_order
+        # Note this uses .sort which does stable sorting in place, which has two
+        # nice properties:
+        # - since the sort is in place, it's memory efficient because it doesn't
+        #   replicate the data
+        # - since the sort is stable, sorting by multiple fields is possible by
+        #   repeatedly sorting in reverse importance order (eg for sorting by
+        #   size first and by name when sizes match, call sort(name_section) and
+        #   then sort(size_section))
         
-        ix = self.sourceModel().createIndex(source_row, 0, source_parent)
+        # When a header is clicked, QT ends up calling sort twice in a row with
+        # the same section and sort order, ignore redundant calls (although this
+        # is not that important because .sort is fast ~O(N) for already sorted
+        # lists)
+        last_sort_section_order = (section, sort_order)
+        if (self.last_sort_section_order != last_sort_section_order):
+            # XXX This sort is case-sensitive, should do lowercase comparison for
+            #     string fields?
+            self.data.sort(
+                reverse=(sort_order == Qt.DescendingOrder), 
+                cmp=lambda x,y: cmp(x[section], y[section])
+            )
+            self.last_sort_section_order = last_sort_section_order
+        else:
+            print "ignoring redundant sort call"
         
-        # Do case-insensitive by default by comparing lowercase
-        filepath = self.sourceModel().getFilepath(ix)
-        filepath = filepath.lower()
-
-        return all([filter_word in filepath for filter_word in self.filter_words])
-
-    def getFilepath(self, ix):
-        ix = self.mapToSource(ix)
+        self.beginResetModel()
+        self.reset()
+        self.endResetModel()
         
-        return self.sourceModel().getFilepath(ix)
-
+    
 
 class MyTableView(QTableView):
     
@@ -182,10 +277,12 @@ class MainWindow(QMainWindow):
 
         combo = QComboBox()
         combo.setEditable(True)
-        combo.lineEdit().returnPressed.connect(self.updateFilter)
+        #combo.lineEdit().returnPressed.connect(self.updateFilter)
+        combo.lineEdit().textEdited.connect(self.updateFilter)
         self.combo = combo
         l.addWidget(combo)
 
+        #sys.argv = [sys.argv[0], u"\\windows\\system32\\"]
         assert len(sys.argv) > 1
 
         dirpaths = sys.argv[1].split(",")
@@ -193,20 +290,17 @@ class MainWindow(QMainWindow):
         for dirpath in dirpaths:
             # Make sure dirpath is unicode so os.dirlist, etc return unicode too
             dirpath = unicode(dirpath)
-            # Incoming path may have backslashes, normalize since Qt5 will generate
-            # with forward slashes
+            # Make the path absolute for good measure, note abspath requires 
+            # to do expanduser first or it will fail to abspath ~
+            dirpath = os.path.abspath(os.path.expanduser(dirpath))
+            # Incoming path may have forward slashes on Windows, normalize 
             dirpath = os.path.normpath(dirpath)
-            # Make the path absolute for good measure
-            dirpath = os.path.abspath(dirpath)
             print "fetching", dirpath
             new_entries = get_entries_qt_dirit(dirpath)
             entries.extend(new_entries)
             print "fetched", len(new_entries), dirpath
         
         model = TableModel(entries, ["Name", "Path", "Size", "Date"])
-        proxy = SortFilterProxyModel(self)
-        proxy.setSourceModel(model)
-        self.proxy = proxy
         self.model = model
 
         table = MyTableView()
@@ -214,12 +308,17 @@ class MainWindow(QMainWindow):
         # combobox
         font = QFont(table.font().family(), combo.font().pointSize())
         table.setFont(font)
-        table.setModel(proxy)
-        table.sortByColumn(2, Qt.DescendingOrder)
+        table.setModel(model)
+        # Set the sort indicator first before enabling sorting, so sorting only
+        # happens once, at enable time
+        table.horizontalHeader().setSortIndicator(2, Qt.DescendingOrder)
+        table.horizontalHeader().sortIndicatorChanged.connect(self.sortModel)
         table.setSortingEnabled(True)
-        table.resizeColumnsToContents()
-        table.resizeRowsToContents()
         table.setSelectionBehavior(QTableView.SelectRows)
+        # Flag the table to be resized to content when the first rows are
+        # inserted. Resize only at startup, don't mess with the size set by the
+        # user after startup
+        self.resize_table_to_contents = True
         # Set the name column to stretch if the wider is larger than the table
         # Note this prevents resizing the name column, but other columns can be
         # resized and the name column will pick up the slack
@@ -227,6 +326,7 @@ class MainWindow(QMainWindow):
         table.doubleClicked.connect(table.launchWithPreferredApp)
         table.filepathCopied.connect(lambda s: self.statusBar().showMessage("Copied path %s" % s, 2000))
         table.defaultAppLaunched.connect(lambda s: self.statusBar().showMessage("Launched %s" % s, 2000))
+        model.rowsInserted.connect(self.onRowsInserted)
         self.table = table
 
         l.addWidget(table)
@@ -239,16 +339,32 @@ class MainWindow(QMainWindow):
         print "done initialization"
 
     
+    def onRowsInserted(self, *args, **kwargs):
+        if (self.resize_table_to_contents):
+            self.table.resizeColumnsToContents()
+            self.table.resizeRowsToContents()
+            self.resize_table_to_contents = False
+        self.updateStatusBar()
+
+    def sortModel(self, *args, **kwargs):
+        self.statusBar().showMessage("Sorting...")
+        self.model.sort(*args, **kwargs)
+        self.statusBar().clearMessage()
+        self.updateStatusBar()
+
     def updateStatusBar(self):
-        ix = QModelIndex()
-        self.status_count_widget.setText("%d/%d" % (
-            self.proxy.rowCount(ix), self.model.rowCount(ix)
+        # Display a "?" indicator if there are still rows to load
+        c = "" if (self.model.loadedRowCount() == self.model.totalRowCount()) else "?"
+        self.status_count_widget.setText("%d%s/%d" % (
+            self.model.filteredRowCount(), 
+            c,
+            self.model.totalRowCount()
         ))
 
     def updateFilter(self):
         filter = self.combo.lineEdit().text()
         self.statusBar().showMessage("Filtering...")
-        self.proxy.setFilter(filter)
+        self.model.setFilter(filter)
         self.statusBar().clearMessage()
         self.updateStatusBar()
 
