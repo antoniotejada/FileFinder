@@ -37,21 +37,28 @@ on Linux,
 
 ## Features
 - Uses PyQt5
-- Works on Raspberry Pi 3 with LXDE
+- Works on Raspberry Pi 2 with LXDE
 - Works on Windows
 - On demand row displaying/virtual table for efficency (but note that
-  directories are still loaded wholesome at startup, just dispalyed on demand as
+  directories are still loaded wholesome at startup, just displayed on demand as
   the table is scrolled to prevent QTableView building startup time)
 - Launch associated applications on doubleclick/enter
-- Copy full path to clipboard on right click
+- Copy all selected paths to clipboard on right click
+- Uses csv for storing the listings, csv are smart updated in the background at
+  app launch
 
 ## Todo
 - Filtering could be faster, needs indexing
 - Sorting could be faster, needs indexing
-- Fetching files is slow, needs storing directory data to disk and doing periodic smart updates
+- Infinite loop safeguards (don't follow links, mounted drives, etc)
+- Pie charts/statistics
+- Bookmarks
+- Storing file type
+- Complex filters (file type, size, date)
 - More keyboard shortcuts (delete, go to search box, etc)
 - Installation instructions/requirements.txt
 - Command line help
 - Configuration file
 - Configuration UI
+- Store file-specific metadata (image sizes, video lengths...)
 - Open Everything data files?

@@ -97,6 +97,85 @@ get_entries_stat_8 43.8139998913 4023
 get_entries_stat_10 42.2720000744 4023
 
 
+dirit vs. dirit_entries
+
+laptop
+
+local SSD
+get_entries_qt_dirit elapsed 2.58800005913 189617
+get_entries_qt_dirit_entries elapsed 2.40499997139 189617
+
+local ethernet
+get_entries_qt_dirit elapsed 23.1849999428 17377
+get_entries_qt_dirit_entries elapsed 22.8410000801 17377
+
+vpn ethernet
+get_entries_qt_dirit elapsed 132.136999846 4023
+get_entries_qt_dirit_entries elapsed 132.345999956 4023
+
+
+rpi
+
+local SDCARD
+get_entries_qt_dirit elapsed 58.2944161892 180016
+get_entries_qt_dirit_entries elapsed 45.5200498104 180016
+
+
+local ethernet
+get_entries_qt_dirit elapsed 26.7698559761 17378
+get_entries_qt_dirit_entries elapsed 26.8442850113 17378
+
+
+vpn ethernet
+get_entries_qt_dirit elapsed 295.552345037 4023
+get_entries_qt_dirit_entries elapsed 296.728530884 4023
+
+
+dirit vs. dirit_sleep
+
+laptop
+
+local SDD 
+get_entries_os elapsed 21.757999897 201708
+get_entries_qt_dirit elapsed 2.39999985695 189624
+get_entries_qt_dirit_sleep elapsed 232.022000074 189624 # without backoff
+get_entries_qt_dirit_sleep elapsed 2.58099985123 189626 # with 0.1ms backoff
+
+local ethernet
+get_entries_os elapsed 97.8519999981 17379
+get_entries_qt_dirit elapsed 23.2139999866 17377
+get_entries_qt_dirit_sleep elapsed 30.9159998894 17377
+
+vpn ethernet
+get_entries_os elapsed 97.8519999981 17379
+get_entries_qt_dirit elapsed 23.2139999866 17377
+get_entries_qt_dirit_sleep elapsed 30.9159998894 17377
+
+rpi
+
+local SDCARD
+get_entries_os elapsed elapsed 56.8725090027 180829 (throws errors when link nesting is too deep)
+get_entries_qt_dirit elapsed 41.6171770096 180125
+get_entries_qt_dirit_sleep elapsed 44.3681790829 180125
+
+
+
+vpn ethernet
+get_entries_os elapsed 333.285113096 4023
+get_entries_qt_dirit elapsed 311.852577925 4023
+get_entries_qt_dirit_sleep elapsed 312.922093868 4023
+
+
+local ethernet
+
+get_entries_os elapsed 55.9796631336 17379
+get_entries_qt_dirit elapsed 28.13712883 17378
+get_entries_qt_dirit_sleep elapsed 27.4534029961 17378
+
+
+
+
+
 """
 
 import datetime
@@ -131,10 +210,9 @@ def get_entries_qt_info(dirpath, recurse = True):
 
 
 def get_entries_qt_dirit(dirpath, recurse = True):
-    print "get_entries_qt_dirit", dirpath
+    ## print "get_entries_qt_dirit", dirpath
 
     entries = []
-    # XXX use subdirs if recurse?
     d = QDirIterator(dirpath)
     while (d.next() != ""):
         if (d.fileName() in [".", ".."]):
@@ -150,11 +228,54 @@ def get_entries_qt_dirit(dirpath, recurse = True):
         
     return entries
 
+
+last_sleep_time = time.time()
+def get_entries_qt_dirit_sleep(dirpath, recurse = True):
+    global last_sleep_time
+    ## print "get_entries_qt_dirit", dirpath
+
+    entries = []
+    d = QDirIterator(dirpath)
+    while (d.next() != ""):
+        if (d.fileName() in [".", ".."]):
+            continue
+        
+        entry = d.fileInfo()
+        if (entry.isDir()):
+            if (recurse):
+                entries.extend(get_entries_qt_dirit_sleep(entry.filePath()))
+
+        else:
+            entries.append((entry.fileName(), dirpath, entry.size(), entry.lastModified()))
+
+        if (time.time() - last_sleep_time > 0.1):
+            QThread.usleep(1)
+            last_sleep_time = time.time()
+            
+    return entries
+
+
+def get_entries_qt_dirit_entries(entries, dirpath, recurse = True):
+    ## print "get_entries_qt_dirit_entries", dirpath
+    d = QDirIterator(dirpath)
+    while (d.next() != ""):
+        if (d.fileName() in [".", ".."]):
+            continue
+        
+        entry = d.fileInfo()
+        if (entry.isDir()):
+            if (recurse):
+                get_entries_qt_dirit_entries(entries, entry.filePath())
+
+        else:
+            entries.append((entry.fileName(), dirpath, entry.size(), entry.lastModified()))
+        
+    return entries
+
 def get_entries_qt_dirit_recursive(dirpath, recurse = True):
     print "get_entries_qt_dirit_recursive", dirpath
     entries = []
     
-    # XXX use subdirs if recurse?
     flags = QDirIterator.Subdirectories if recurse else 0
     d = QDirIterator(dirpath, flags)
     while (d.next() != ""):
@@ -200,14 +321,18 @@ def get_entries_stat(dirpath, recurse=True, queue = None):
     return entries
 
 def get_entries_os(dirpath, recurse=True, queue = None):
-    print "get_entries_os", dirpath
+    #print "get_entries_os", dirpath
+
     entries = []
     
     for entry in os.listdir(dirpath):
         entry_filepath = os.path.join(dirpath, entry)
         try:
+            # Don't recurse links to avoid infinite loops
+            # XXX This is too conservative wrt dirit, should check realpaths and
+            #     do proper infinite loop finding?
             if (os.path.isdir(entry_filepath)):
-                if (recurse):
+                if (recurse and not(os.path.islink(entry_filepath))):
                     if (queue is not None):
                         queue.put(entry_filepath)
 
@@ -231,32 +356,39 @@ def get_entries_os(dirpath, recurse=True, queue = None):
     return entries
 
 
-dirpath = unicode("\\\\poo\\usb1\\temp\\")
-#dirpath = unicode("\\\\hiltrud\\usb1\\temp\\")
 dirpath = unicode(sys.argv[1])
 print repr(dirpath)
 
-if (True):
-    print "get_entries_qt_dirit_recursive", 
-    t = time.time() 
-    g_entries = get_entries_qt_dirit_recursive(dirpath)
-    print "elapsed", time.time() - t, len(g_entries)
-    print "get_entries_qt_info", 
-    t = time.time() 
-    g_entries = get_entries_qt_info(dirpath)
-    print "elapsed", time.time() - t, len(g_entries)
-    print "get_entries_qt_dirit", 
-    t = time.time() 
-    g_entries = get_entries_qt_dirit(dirpath)
-    print "elapsed", time.time() - t, len(g_entries)
-    print "get_entries_os", 
-    t = time.time()
-    g_entries = get_entries_os(dirpath)
-    print "elapsed", time.time() - t, len(g_entries)
-    print "get_entries_stat", 
-    t = time.time() 
-    g_entries = get_entries_stat(dirpath)
-    print "elapsed", time.time() - t, len(g_entries)
+print "get_entries_os", 
+t = time.time()
+g_entries = get_entries_os(dirpath)
+print "elapsed", time.time() - t, len(g_entries)
+print "get_entries_qt_dirit", 
+t = time.time() 
+g_entries = get_entries_qt_dirit(dirpath)
+print "elapsed", time.time() - t, len(g_entries)
+print "get_entries_qt_dirit_sleep", 
+t = time.time() 
+g_entries = get_entries_qt_dirit_sleep(dirpath)
+print "elapsed", time.time() - t, len(g_entries)
+
+sys.exit()
+print "get_entries_qt_dirit_entries", 
+t = time.time()
+g_entries = get_entries_qt_dirit_entries([], dirpath)
+print "elapsed", time.time() - t, len(g_entries)
+print "get_entries_qt_dirit_recursive", 
+t = time.time() 
+g_entries = get_entries_qt_dirit_recursive(dirpath)
+print "elapsed", time.time() - t, len(g_entries)
+print "get_entries_qt_info", 
+t = time.time() 
+g_entries = get_entries_qt_info(dirpath)
+print "elapsed", time.time() - t, len(g_entries)
+print "get_entries_stat", 
+t = time.time() 
+g_entries = get_entries_stat(dirpath)
+print "elapsed", time.time() - t, len(g_entries)
 
 def worker(queue):
     print thread.get_ident(), "starting worker"
