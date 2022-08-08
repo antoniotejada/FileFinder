@@ -36,20 +36,21 @@ on Linux,
 
 
 ## Features
-- Uses PyQt5
+- Uses PyQt5, Python 2.7 and sqlite3
 - Works on Raspberry Pi 2 with LXDE
 - Works on Windows
 - On demand row displaying/virtual table for efficency (but note that
   directories are still loaded wholesome at startup, just displayed on demand as
   the table is scrolled to prevent QTableView building startup time)
 - Launch associated applications on doubleclick/enter
-- Copy all selected paths to clipboard on right click
-- Uses csv for storing the listings, csv are smart updated in the background at
-  app launch
+- Copy all selected paths to clipboard on right click/ctrl+c
+- Uses sqlite3 as database, smart updated in the background at app launch
 
 ## Todo
-- Filtering could be faster, needs indexing
-- Sorting could be faster, needs indexing
+- Try sqlite3 Full Text Search
+- Move db update to a different process (prevent GIL UI stalls)
+- Server/Client (allow servers to index local filesystems and expose them
+  to clients)
 - Infinite loop safeguards (don't follow links, mounted drives, etc)
 - Pie charts/statistics
 - Bookmarks
