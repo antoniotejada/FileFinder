@@ -22,6 +22,7 @@ XXX QtSql needs
         apt-get install python-pyqt5.qtsql
     on raspberry pi and has upto FTS5
 XXX See https://blog.kapeli.com/sqlite-fts-contains-and-suffix-matches
+XXX See https://github.com/mayflower/sqlite-reverse-string (search for reverse token so no need to insert all prefixes)
 XXX See FTS5 trigram (note needs 2020 sqlite 3.34.0)
 XXX See https://github.com/simonw/sqlite-fts5-trigram
 XXX See https://pypi.org/project/sqlitefts/
@@ -36,10 +37,11 @@ import datetime
 import errno
 import logging
 import os
-import string
 import sqlite3
+import stat
+import string
 import sys
-import time
+
 
 from PyQt5.QtCore import *
 from PyQt5.QtGui import *
@@ -87,6 +89,36 @@ def error(*args, **kwargs):
 
 def exc(*args, **kwargs):
     logger.exception(*args, **kwargs)
+
+
+def which(exepath):
+    """
+    For an executable in the environment's path, return
+    - the absolute path to exepath 
+    - None if the exepath cannot be found in the path or if it's not executable
+    """
+    info("which %r", exepath)
+
+    def is_exe(fpath):
+        return (os.path.isfile(fpath) and os.access(fpath, os.X_OK))
+
+    if (os.path.isabs(exepath)):
+        if (is_exe(exepath)):
+            return exepath
+
+    else:
+        # Check empty path (in case exepath is absolute), current directory, and
+        # PATH 
+        # XXX This doesn't handle pathsep escaping
+        search_paths = ["", "."] + os.environ["PATH"].split(os.pathsep)
+        for path in search_paths:
+            exe_filepath = os.path.join(path, exepath)
+            info("Searching for executable %r in path %r", exe_filepath, path)
+            if is_exe(exe_filepath):
+                info("Found executable %r in path %r", exe_filepath, path)
+                return exe_filepath
+
+    return None
 
 
 def launch_with_preferred_app(filepath):
@@ -307,6 +339,9 @@ class TableModel(QAbstractTableModel):
         if (self.cursor is not None):
             self.cursor.close()
 
+        # XXX total_row_count should be updated in other places without needing
+        #     to refresh the filter to update it (eg when receiving the signal
+        #     that rows have been inserted/directories traversed?)
         self.total_row_count = self.conn.execute("SELECT count(*) FROM files").fetchone()[0]
 
         # Build the filter clause
@@ -316,7 +351,13 @@ class TableModel(QAbstractTableModel):
             filter_clauses = []
             for filter_word in self.filter_words:
                 filter_params.append(filter_word)
-                # XXX Note like is case-insensitive, may need changing if
+                # XXX Allow verbatim here when surrounded by quotation marks
+                #     This means not using "%" prefix and/or suffix in the LIKE
+                #     clause or not using a LIKE clause if there are start and
+                #     end quotation marks, also not concatenating path and name
+                #     and also case-sensitive?
+
+                # XXX Note LIKE is case-insensitive, may need changing if
                 #     case-sensitivity can be set
 
                 # XXX Note an index for path || name can be created but it's
@@ -356,8 +397,7 @@ class TableModel(QAbstractTableModel):
         #     of the new filter (less or longer words), could store the result
         #     in a table and fetch from that table if the new filter is a subset?
 
-        # Do case-insensitive by default by comparing lowercase
-        self.filter_words = filter.lower().split()
+        self.filter_words = filter.split()
         self.beginResetModel()
         # XXX This should try to preserve the focused and selected rows
         self.reset()
@@ -493,13 +533,6 @@ class TableView(QTableView):
         
         self.menu.popup(QCursor.pos())
 
-      
-class VLine(QFrame):
-    # a simple VLine, like the one you get from designer
-    # See https://stackoverflow.com/questions/57943862/pyqt5-statusbar-separators
-    def __init__(self):
-        super(VLine, self).__init__()
-        self.setFrameShape(self.VLine|self.Sunken)
 
 class MainWindow(QMainWindow):
     # XXX Add option to create new window/instance? Allow multiple instances of
@@ -559,6 +592,7 @@ class MainWindow(QMainWindow):
         font = QFont(table.font().family(), combo.font().pointSize())
         table.setFont(font)
         table.setModel(model)
+        table.setWordWrap(False) 
         # Set the sort indicator first before enabling sorting, so sorting only
         # happens once, at enable time
         table.horizontalHeader().setSortIndicator(2, Qt.DescendingOrder)
@@ -575,18 +609,32 @@ class MainWindow(QMainWindow):
         # resized and the name column will pick up the slack
         table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         table.doubleClicked.connect(table.launchWithPreferredApp)
-        table.filepathCopied.connect(lambda s: self.statusBar().showMessage("Copied path %s" % s, 2000))
-        table.defaultAppLaunched.connect(lambda s: self.statusBar().showMessage("Launched %s" % s, 2000))
+        table.filepathCopied.connect(lambda s: self.showMessage("Copied path %s" % s, 2000))
+        table.defaultAppLaunched.connect(lambda s: self.showMessage("Launched %s" % s, 2000))
         model.rowsInserted.connect(self.onRowsInserted)
         self.table = table
 
         l.addWidget(table)
         
-        self.statusBar().addPermanentWidget(VLine())
+        
+        frame_style = QFrame.WinPanel | QFrame.Sunken
+
+        # Can't set sunken style on QStatusBar.showMessage, use a widget and
+        # reimplement showMessage and clearMessage
+        timer = QTimer()
+        timer.setSingleShot(True)
+        timer.timeout.connect(self.clearMessage)
+        self.status_message_timer = timer
+
+        self.status_message_widget = QLabel()
+        self.status_message_widget.setFrameStyle(frame_style)
+        self.statusBar().addWidget(self.status_message_widget, 1)
+
         self.status_widget = QLabel()
+        self.status_widget.setFrameStyle(frame_style)
         self.statusBar().addPermanentWidget(self.status_widget)
-        self.statusBar().addPermanentWidget(VLine())
         self.status_count_widget = QLabel()
+        self.status_count_widget.setFrameStyle(frame_style)
         self.statusBar().addPermanentWidget(self.status_count_widget)
         
         self.updateStatusBar()
@@ -625,35 +673,46 @@ class MainWindow(QMainWindow):
         self.worker.started.connect(lambda s: self.status_widget.setText("%s" % s), connection_type)
         self.worker.finished.connect(self.thread.quit)
         self.worker.finished.connect(lambda : self.status_widget.setText("Idle"), connection_type)
-        self.worker.finished.connect(lambda : self.statusBar().clearMessage(), connection_type)
+        self.worker.finished.connect(self.clearMessage, connection_type)
         self.worker.finished.connect(self.worker.deleteLater)
         self.thread.finished.connect(self.thread.deleteLater)
 
-        self.worker.traversing.connect(lambda s: self.statusBar().showMessage("%s" % s), connection_type)
+        self.worker.traversing.connect(self.showMessage, connection_type)
+        
         # XXX Setting Idle priority doesn't seem to make any difference to the
         #     UI freezes, docs say in Linux priority is not supported?
         self.thread.start(QThread.IdlePriority)
                 
         info("done initialization")
 
-    
+
+    def showMessage(self, msg, timeout_ms=0):
+        self.status_message_timer.stop()
+        self.status_message_widget.setText(msg)
+        if (timeout_ms > 0):
+            self.status_message_timer.start(timeout_ms)
+            
+    def clearMessage(self):
+        self.status_message_widget.setText("")
+
     def onRowsInserted(self, index, start, end):
         dbg("onRowsInserted %d %d %d %d", index.row(), index.column(), start, end)
         if (self.resize_table_to_contents):
-            # There should be some rows in the table
-            # assert (self.table.model().filteredRowCount() > 0)
-            info("resizing for rows %d", self.table.model().loadedRowCount())
+            info("resizing using %d loaded rows", self.table.model().loadedRowCount())
             self.table.resizeColumnsToContents()
             self.table.resizeRowsToContents()
+            # Now that there's a minimum row height, set that one as default for
+            # future rows
+            self.table.verticalHeader().setDefaultSectionSize(self.table.rowHeight(0))
             self.resize_table_to_contents = False
         self.updateStatusBar()
 
     def sortModel(self, section, sort_order):
         # XXX This could preserve the selection and focus by saving before sort
         #     and restoring aftersort?
-        self.statusBar().showMessage("Sorting...")
+        self.showMessage("Sorting...")
         self.model.sort(section, sort_order)
-        self.statusBar().clearMessage()
+        self.clearMessage()
         
     def updateStatusBar(self):
         # Display a "?" indicator if there are still rows to load
@@ -667,11 +726,24 @@ class MainWindow(QMainWindow):
     def updateFilter(self):
         filter = self.combo.lineEdit().text()
         
-        self.statusBar().showMessage("Filtering...")
+        self.showMessage("Filtering...")
         self.model.setFilter(filter)
-        self.statusBar().clearMessage()
+        self.clearMessage()
         self.updateStatusBar()
 
+
+def is_enoent(e):
+    # XXX Missing protecting against:
+    #   Linux:
+    #   host is down errno 112 (Linux) EHOSTDOWN maybe also EHOSTUNREACH?
+    #   Windows:
+    #   network path not found WindowsError.winerror 53. Note that the
+    #   errno for this one is ENOENT
+    return (
+        (e.errno == errno.ENOENT) and
+        # WinError doesn't exist on Unix, guard against that
+        ((e.__class__.__name__ != "WindowsError") or (e.winerror != 53))
+    )
 
 class Worker(QObject):
     traversing = pyqtSignal(str)
@@ -760,7 +832,10 @@ class Worker(QObject):
             # XXX In addition, this is wrong when the directory was deleted and
             #     leaves this phantom directory with 0 date
             subdirpath_max_mtime = 0
-            warn("Missing subdirpath %s from database, recreating now", subdirpath)
+            # XXX This is none when there's a network error that wasn't trapped
+            #     properly elsewhere, raise exception or creating it will cause
+            #     the files to be removed from the database and fix it elsewhere
+            raise Exception("Missing subdirpath %s from database, previous network error?", subdirpath)
             inserted_row = (
                 os.path.basename(subdirpath),
                 os.path.dirname(subdirpath),
@@ -768,6 +843,8 @@ class Worker(QObject):
                 0
             )
             conn.execute("INSERT INTO files VALUES (?, ?, ?, ?)", inserted_row)
+            
+            
 
         else:
             # Note this could be 0 if this directory was never traversed so the
@@ -783,19 +860,19 @@ class Worker(QObject):
         # XXX This time was already recovered somewhere, find where and don't
         #     fetch it?
         try:
+            dbg("getmtiming sd %r", subdirpath)
             subdirpath_mtime = int(os.path.getmtime(subdirpath) * 1000.0)
+            dbg("getmtimed sd %r", subdirpath)
 
         except OSError as e:
-            # XXX Missing protecting against:
-            #   Linux:
-            #   host is down errno 112 (Linux) EHOSTDOWN maybe also EHOSTUNREACH?
-            #   Windows
-            #   network path not found WindowsError.winerror 53
-            # XXX Not clear why this didn't raise on windows one time the host was
-            #     down?
-            if (e.errno != errno.ENOENT):
+            exc("Error %r calling getmtime for subdirpath %r, raising if not ENOENT %d vs %d", 
+                e, subdirpath, e.errno, errno.ENOENT)
+            if (not is_enoent(e)):
+                # XXX Raising here prevents deleting valid entries from the
+                #     database, trap and handle properly
                 raise
-            dbg("Deleting children for subdirpath %r", subdirpath)
+
+            info("Deleting children for subdirpath %r", subdirpath)
             subdirpath_mtime = subdirpath_max_mtime + 1
         
         # XXX Note testing the subdirpath mtime is not robust enough, will fail
@@ -813,11 +890,17 @@ class Worker(QObject):
                 # XXX This fails with long paths on Windows, need to use long
                 #     path prefix, see
                 #     https://stackoverflow.com/questions/18390341/unable-to-locate-files-with-long-names-on-windows-with-python
+                dbg("listdiring %r", subdirpath)
                 filenames = os.listdir(subdirpath)
+                dbg("listdired %r", subdirpath)
                 filenames.sort()
 
             except OSError as e:
-                if (e.errno != errno.ENOENT):
+                exc("Error %r calling listdir for subdirpath %r, raising if not ENOENT %d vs %d", 
+                    e, subdirpath, e.errno, errno.ENOENT)
+                if (not is_enoent(e)):
+                    # XXX Raising here prevents deleting valid entries from the
+                    #     database, trap and handle properly
                     raise
                 filenames = []
 
@@ -861,15 +944,18 @@ class Worker(QObject):
                     # XXX This needs to guard against file unavailable, etc
                     # XXX This fails for long paths
                     filepath = os.path.join(subdirpath, filename)
-                    is_dir = os.path.isdir(filepath)
+                    dbg("stating %r", filepath)
+                    filestat = os.stat(filepath)
+                    dbg("stated %r", filepath)
+                    is_dir = stat.S_ISDIR(filestat.st_mode)
                     inserted_row = (
                         filename,
                         subdirpath,
-                        -1 if is_dir else os.path.getsize(filepath),
+                        -1 if is_dir else filestat.st_size,
                         # Set mtime to zero for new directories so they are not
                         # ignored by the smart update. The directory date will
                         # be properly set when visited
-                        0 if is_dir else int(os.path.getmtime(filepath) * 1000.0)
+                        0 if is_dir else int(filestat.st_mtime * 1000.0)
                     )
                     if (is_dir):
                         # Create a dummy entry for this directory so the outer
@@ -903,9 +989,20 @@ class Worker(QObject):
                         #     would make the rename case just a re-link and make
                         #     DB a lot smaller, but would the query be slower?
                         #     From tests, a DB with rowids instead of paths is
-                        #     38% of the size, the no-results join query is 3x
-                        #     slower, the no-results in (select) query is 10%
+                        #     38% of the size, the no-results query is 2x
+                        #     faster, the results in (select) query is 10%
                         #     slower
+                        # XXX Also split filename into filename and extension so
+                        #     extension can be easily searched? and build
+                        #     indices on uppercase(extension)
+                        #     Note sqlite doesn't have string functions that can
+                        #     easily split the extension, needs a complicated
+                        #     one for every possible extension length, eg
+                        #     select iff(substr(name, -4, 1) = ".", lower(substr(name, -3)), 
+                        #           iff(substr(name, -3, 1) = ".", lower(substr(name, -2)),
+                        #               ""
+                        #           )
+                        #       ) from files;
 
                         dummy_row = (
                             ".",
@@ -948,11 +1045,24 @@ class Worker(QObject):
             info("updating time for %r to %d max was %d", subdirpath, subdirpath_mtime, subdirpath_max_mtime)
             conn.execute("UPDATE files SET mtime = ? WHERE ((name = ?) AND (path = ?))",
                 [subdirpath_mtime, os.path.basename(subdirpath), os.path.dirname(subdirpath)])
-            # Commit any changes
-            info("committing changes for %r", subdirpath)
-            conn.commit()
+            
 
             if (refresh_read_cursor):
+                # Commit any changes only when the read cursor changes, other
+                # changes will be committed by the caller, since commit causes
+                # ~0.5s stalls on the sqlite version that comes with the last
+                # Python that supports Windows XP
+                # XXX This could commit in the loop above after some time or 
+                #     some number of changes so directories with lots of files 
+                #     are resumed rather than aborted in the presence of errors
+                
+                # XXX Conversely, ideally this could commit even less often than
+                #     at read cursor update time, since there are still visible
+                #     stalls on XP, but that requires more complex logic for the
+                #     read cursor update
+                info("committing changes for %r", subdirpath)
+                conn.commit()
+                
                 # Note this query can spill into other dirpaths, the caller has
                 # to handle that and stop
                 info("refreshing read cursor")
@@ -1053,8 +1163,16 @@ class Worker(QObject):
             #     deletes so it can be threaded and this thread perform the
             #     database updates
             row = self.update_db_subdir(conn, read_cursor, subdirpath, row)
+
+        # Commit causes ~0.5s stalls on the sqlite version in Python that
+        # supports Windows XP (can be fixed by copying a more recent sqlite
+        # dll), so update_db_subdir only commits when there's a new directory
+        # inserted (because when that happens the read cursor needs to be
+        # updated). Commit conservatively here in case update_db_subdir left
+        # some updates uncommited.
+        info("conservatively committing changes for %r", dirpath)
+        conn.commit()
         
-            
         read_cursor.close()
 
         # export to csv
@@ -1085,12 +1203,168 @@ class Worker(QObject):
     
     def run(self):
         dirpaths = sys.argv[1].split(",")
+        info("Starting worker thread for %r", dirpaths)
         for dirpath in dirpaths:
             self.update_db(dirpath)
-
         self.finished.emit()
+        info("Ended worker thread for %r", dirpaths)
+
+
+def verify_pyqt5_installation():
+    # Anaconda 2.3.0 puts DLLs in pkgs/<module_version>/Library/bin folders but
+    # forgets to add them to the path and cannot later be found, include those
+    # in the path. Anaconda 2.2.0 doesn't have this issue
+    add_anaconda_dlls_to_path = False
+    if (add_anaconda_dlls_to_path):
+        pkgs_dir = R"c:\Anaconda\pkgs"
+        for pkg_dir in os.listdir(pkgs_dir):
+            pkg_filepath = os.path.join(pkgs_dir, pkg_dir)
+            library_bin_path = os.path.join(pkg_filepath, "Library", "bin")
+            if (os.path.exists(library_bin_path )) and not pkg_dir.startswith("sqlite"):
+                info("adding DLL library path %s", library_bin_path)
+                os.environ["PATH"] = library_bin_path + ";" + os.environ["PATH"]
+
+    # Anaconda 2.2.0 and 2.3.0 fail to set QT_PLUGIN_PATH giving the error
+    # "couldn't find or load qt platform plugin "windows"
+    # See https://github.com/ContinuumIO/anaconda-issues/issues/1270
+    # See https://github.com/pyqt/python-qt5/issues/2
+    # See https://github.com/ContinuumIO/anaconda-issues/issues/1270
+    # See https://github.com/pyqt/python-qt5/wiki/Qt-Environment-Variable-Reference#qt-plugin-path
+    # See https://github.com/pyqt/python-qt5/blob/master/qt.conf
+    # See https://stackoverflow.com/questions/51286721/changing-qt-plugin-path-in-environment-variables-causes-programs-to-fail
+    # On 64-bit python-qt5 pip installs, this is properly set to
+    #   C:\Python27\lib\site-packages\PyQt5\plugins 
+    # when C:\Python27\Lib\site-packages\PyQt5\__init__.py runs since this commit
+    # https://github.com/pyqt/python-qt5/blob/06ce5b1d1909929130ee0cc8b53e0199d92cbcfd/PyQt5/__init__.py
+    # until this commit that updates to Qt 5.4
+    # https://github.com/pyqt/python-qt5/blob/93b127adc95e681ea87abd9ab5e66a0e299fce19/PyQt5/__init__.py
+    # which moves qt.conf generation to setup.py
+    # It also ships a proper C:\Python27\Lib\site-packages\PyQt5\qt.conf
+    # which contains the entries
+    #   Prefix = C:/Python27/Lib/site-packages/PyQt5
+    #   Binaries = C:/Python27/Lib/site-packages/PyQt5
+    # (a specific entry Plugins is also allowed, default is "plugins", see
+    # https://doc.qt.io/qt-6/qt-conf.html)
+    # But Anaconda 2.2.0 only has Qt4 qt.conf around 
+    #   C:\Anaconda\Lib\site-packages\PyQt4\qt.conf
+    #   C:\Anaconda\qt.conf
+    # With the entries
+    #   [Paths]
+    #   Prefix = ./Lib/site-packages/PyQt4
+    #   Binaries = ./Lib/site-packages/PyQt4
+    # And C:\Anaconda\pkgs\pyqt-5.6.0-py27_2\Lib\site-packages\PyQt5\__init__.py
+    # is empty.
+    # In addition, a python-qt5 anaconda installation doesn't have neither DLLs in 
+    # path nor a plugin subdir but in C:\Anaconda\pkgs\qt-5.6.2-vc9_6\Library
+    # in that path, instead that one is on 
+    # C:\Anaconda\pkgs\qt-5.6.2-vc9_6\Library\bin\Qt5Gui.dll
+    # XXX This path will probably change with anaconda qt updates, not clear the
+    #     best way of getting this, probably move to a conda batch file?
+    # XXX This needs to be set before any Qt usage, but can be set after the imports
+    
+    # Anaconda 2.2.0 and 2.3.0 (the last versions that are known to work on
+    # 32-bit Windows XP) fail to install Qt properly: don't set QT_PLUGIN_PATH
+    # nor provide a qt.conf file. 
+    #
+    # Those Anacondas require QT_PLUGIN_PATH to be set manually before running
+    # the app. Note this is an Anaconda-specific problem, other environments
+    # either set QT_PLUGIN_PATH (eg 64-bit Windows 10 PyQt5 5.3.2 installed from
+    # pip) or provide qt.conf (eg Linux PyQt 5.11.3 installed from pip) or both.
+    needs_qt_plugin_path = (" 32 bit " in sys.version) and  ("|Continuum Analytics, Inc.|" in sys.version)
+    if (needs_qt_plugin_path and ("QT_PLUGIN_PATH" not in os.environ)):
+        # XXX Note that QT_PLUGIN_PATH set is not necessary for PyQt5 to work,
+        #     eg Linux PyQt 5.11.3 doesn't set it but it works (and setting one
+        #     gets ignored when the first QApplication is created)
+        #os.environ["QT_PLUGIN_PATH"] = R"C:\Anaconda\pkgs\qt-5.6.2-vc9_6\Library\plugins"
+        raise Exception("QT_PLUGIN_PATH not set but conda Python found \"%s\"\n"
+            "Qt applications will fail with \"couldn't find or load qt platform plugin \"windows\"\"\n"
+            "Set QT_PLUGIN_PATH to point to Qt plugins before running the application, eg\n"
+            "SET QT_PLUGIN_PATH C:\\Anaconda\\pkgs\\qt-5.6.2-vc9_6\\Library\\plugins\n" % sys.version)
+
+
+def verify_sqlite_installation():
+    # Latest Python version known to work with Windows XP is said to be 2.7.9,
+    # but anaconda updates to Python 2.8.13 and seems to work See
+    # https://stackoverflow.com/questions/47516712/what-versions-of-python-will-work-in-windows-xp
+    # Needs sqlite3 WAL journal mode which is implemented in 3.7.4 or higher: 
+    # - Python 2.7.9 comes with sqlite 3.6.21, this is Anaconda's 2.2.0 Python 
+    # - Python 2.7.13 comes with pysqlite 2.6.0 sqlite 3.8.11, this is
+    #   Anaconda's 2.2.0 Python after creating a Python environment which comes
+    #   with QtPlugin path missing, Qt 5.6.2 PyQt 5.6. This has performance issues
+    #   at commit time.
+    # - Python 2.7.18 comes with pysqlite 2.6.0, sqlite 3.28.0, this is the
+    #   last 2.7 Python version 
+    #   But note that the Python version is not definitive since sqlite 3.6.21
+    #   (vs. 3.28.0) which doesn't have WAL (needs 3.7.4)
+    # The lastest sqlite3.dll win32 3.39.2 works fine on xp after copied to the
+    # virtual env used c:\Anaconda\envs\p2
+    # QSqlDatabase sqlite for PyQt5 is supposed to be 3.33 (unverified)
+    min_sqlite3_version = (3, 5, 4)
+    if (sqlite3.sqlite_version_info < min_sqlite3_version):
+        # XXX This could check WAL support via pragma instead of sqlite version?
+        raise Exception("Version %s sqlite3 needed but %s found", min_sqlite3_version, sqlite3.version_info)
+
+    slow_sqlite3_version = (3, 8, 11)
+    if (sqlite3.sqlite_version_info <= slow_sqlite3_version):
+        warn("Version %s sqlite3 is known to have performance issues and found %s." +
+             " Versions higher than %s may or may not have performance issues, 3.28.0 and higher are known to be ok.", 
+            slow_sqlite3_version, sqlite3.sqlite_version_info, slow_sqlite3_version)
+
+
+def report_versions():
+    info("Python version: %s", sys.version)
+
+    info("pysqlite version: %s", sqlite3.version)
+    info("sqlite version: %s", sqlite3.sqlite_version)
+    conn = sqlite3.connect(":memory:")
+    cursor = conn.execute("PRAGMA compile_options;")
+    sqlite_compile_options = list(cursor)
+    conn.close()
+    info("sqlite compile options: %s", sqlite_compile_options)
+    
+    info("Qt version: %s", QT_VERSION_STR)
+    info("PyQt version: %s", PYQT_VERSION_STR)
+    pyqt5_sqlite_version = "Not installed"
+    pyqt5_sqlite_compile_options = []
+    try:
+        from PyQt5.QtSql import QSqlDatabase
+        db = QSqlDatabase.addDatabase("QSQLITE")
+        db.open()
+        query = db.exec_("SELECT sqlite_version();")
+        query.first()
+        pyqt5_sqlite_version = query.value(0)
+
+        query = db.exec_("PRAGMA compile_options;")
+        while (query.next()):
+            pyqt5_sqlite_compile_options.append(query.value(0))
+        db.close()
+    
+    except:
+        # On Linux QtSql import is known to fail when python-pyqt5.qtsql is not
+        # installed, needs 
+        #   apt install python-pyqt5.qtsql 
+        # It's okay to fail to import QtSql since it's not used for the time
+        # being, just ignore
+        warn("QtSql not installed, unable to report QtSql version (QtSql may be needed in the future but right now it's not used)")
+
+    info("QSQLITE version: %s", pyqt5_sqlite_version)
+    info("QSQLITE compile options: %s", pyqt5_sqlite_compile_options)
+    info("Qt plugin path: %s", os.environ.get("QT_PLUGIN_PATH", "Not set"))
+    info("QCoreApplication.libraryPaths: %s", QCoreApplication.libraryPaths())
+    info("QLibraryInfo.PrefixPath: %s", QLibraryInfo.location(QLibraryInfo.PrefixPath))
+    info("QLibraryInfo.PluginsPath: %s", QLibraryInfo.location(QLibraryInfo.PluginsPath))
+    info("QLibraryInfo.LibrariesPath: %s", QLibraryInfo.location(QLibraryInfo.LibrariesPath))
+    info("QLibraryInfo.LibrarieExecutablesPath: %s", QLibraryInfo.location(QLibraryInfo.LibraryExecutablesPath))
+    info("QLibraryInfo.BinariesPath: %s", QLibraryInfo.location(QLibraryInfo.BinariesPath))
+
 
 def main():
+    report_versions()
+    
+    verify_pyqt5_installation()
+    
+    verify_sqlite_installation()
+
     create_db = False
     if (create_db):
         try:
@@ -1119,13 +1393,19 @@ def main():
         # See http://devdoc.net/database/sqlite-3.0.7.2/pragma.html
         # See https://stackoverflow.com/questions/63099657/sqlite-pragma-journal-mode-statement-persistence
         
-        # XXX Note this leaves a huge 4GB WAL file that doesn't get properly deleted?
+        # XXX Note this leaves a huge 4GB WAL file that sometimes doesn't get
+        #     deleted
         #     See https://sqlite-users.sqlite.narkive.com/Vc9ivjzP/persistence-of-wal-and-shm
         #     See https://sqlite.org/wal.html
         # XXX Sometimes it gets deleted just by closing the python app going to
-        #     sqlite3 and doing .tables and exit
-        # XXX This also causes a long stall if the removal happens at db open time, 
-        #     try to checkpoint manually and showing some progress?
+        #     sqlite3 and doing .tables and exit, sometimes it gets deleted the
+        #     next time the app is started
+        # XXX This also causes a long stall if the removal happens at db open
+        #     time (or close?), try to checkpoint manually and showing some
+        #     progress?
+        #     Looks like the journal_mode can be changed to delete and back for 
+        #     that
+        #     See https://stackoverflow.com/questions/51535178/how-to-manually-perform-checkpoint-in-sqlite-android
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.executescript("""
             CREATE TABLE files(name TEXT NOT NULL, path TEXT NOT NULL, size INTEGER NOT NULL, mtime EPOCH, PRIMARY KEY (path, name));
@@ -1140,8 +1420,11 @@ def main():
         conn.commit()
         conn.close()
     
-    
     app = QApplication(sys.argv)
+    # Documentation says libraryPaths is only valid be used after a QApplication
+    # is created, and will contain the value QT_PLUGIN_PATH was set to and
+    # others
+    info("QCoreApplication.libraryPaths: %s", QCoreApplication.libraryPaths())
     ex = MainWindow()
     ex.show()
     sys.exit(app.exec_())
