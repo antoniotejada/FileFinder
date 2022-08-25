@@ -99,6 +99,8 @@ on Linux,
 - PyQt5 
 
 ## Todo
+- Move paths to its own table instead of replicating them on every file (reduces
+  database size)
 - Try sqlite3 Full Text Search
 - Move db update to a different process (prevent GIL UI stalls)
 - Server/Client (allow servers to index local filesystems and expose them

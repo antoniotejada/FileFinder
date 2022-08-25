@@ -821,30 +821,19 @@ class Worker(QObject):
         subdirpath_max_mtime = conn.execute("SELECT mtime FROM files WHERE ((path == ?) AND (name = ?))", 
             [os.path.dirname(subdirpath), os.path.basename(subdirpath)]).fetchone()
         if (subdirpath_max_mtime is None):
-            # XXX This should never be none, even the root path is created in
-            #     the outer loop (in order for smart updates to work) but some
-            #     traversals hit this (maybe some problem with not trapping
-            #     exceptions/exit? investigate)
-            #
-            #     When it's none, trying to set the subdirpath_mtime below
-            #     will fail and this subdirpath will always fail to be smart skipped
-            #     so this should be unconditionally created here?
-            # XXX In addition, this is wrong when the directory was deleted and
-            #     leaves this phantom directory with 0 date
+            # This is None when a directory was deleted from the filesystem,
+            # detected and deleted from the database when traversin the parent,
+            # but children are still around in the database so the directory
+            # is picked up again in the outer loop.
+            # XXX The outer loop should only pick directories and not try to
+            #     work them out from files? (leftover from when only files were
+            #     stored)
+            info("None SELECT mtime, deleting children for subdirpath %r", subdirpath)
+
             subdirpath_max_mtime = 0
-            # XXX This is none when there's a network error that wasn't trapped
-            #     properly elsewhere, raise exception or creating it will cause
-            #     the files to be removed from the database and fix it elsewhere
-            raise Exception("Missing subdirpath %s from database, previous network error?", subdirpath)
-            inserted_row = (
-                os.path.basename(subdirpath),
-                os.path.dirname(subdirpath),
-                -1,
-                0
-            )
-            conn.execute("INSERT INTO files VALUES (?, ?, ?, ?)", inserted_row)
-            
-            
+            # Fall through, this will hit two exceptions below, one to getmtime,
+            # the other to listdir and proceed to delete all children one by
+            # one
 
         else:
             # Note this could be 0 if this directory was never traversed so the
@@ -868,11 +857,13 @@ class Worker(QObject):
             exc("Error %r calling getmtime for subdirpath %r, raising if not ENOENT %d vs %d", 
                 e, subdirpath, e.errno, errno.ENOENT)
             if (not is_enoent(e)):
-                # XXX Raising here prevents deleting valid entries from the
-                #     database, trap and handle properly
+                # XXX Raising here when not ENOENT (eg temporary network
+                #     error) prevents deleting valid entries from the
+                #     database which is good, but will abort the program.
+                #     Trap, backoff, and retry instead
                 raise
 
-            info("Deleting children for subdirpath %r", subdirpath)
+            info("ENOENT for getmtime, deleting children for subdirpath %r", subdirpath)
             subdirpath_mtime = subdirpath_max_mtime + 1
         
         # XXX Note testing the subdirpath mtime is not robust enough, will fail
@@ -899,9 +890,12 @@ class Worker(QObject):
                 exc("Error %r calling listdir for subdirpath %r, raising if not ENOENT %d vs %d", 
                     e, subdirpath, e.errno, errno.ENOENT)
                 if (not is_enoent(e)):
-                    # XXX Raising here prevents deleting valid entries from the
-                    #     database, trap and handle properly
+                    # XXX Raising here when not ENOENT (eg temporary network
+                    #     error) prevents deleting valid entries from the
+                    #     database which is good, but will abort the program.
+                    #     Trap, backoff, and retry instead
                     raise
+                info("ENOENT for listdir, deleting children for subdirpath %r", subdirpath)
                 filenames = []
 
             i_filename = 0
@@ -1037,7 +1031,18 @@ class Worker(QObject):
                     row = read_cursor.fetchone()
                     # Commit is done when updating the date the subdirpath being
                     # traversed
-
+                    # No need to refresh the read cursor since this item is
+                    # being skipped and deleted, so there's no risk of skipping
+                    # newer items
+                    
+                    # XXX This could delete by prefix query which in the case of
+                    #     deleting directories would prevent the children to be
+                    #     hit again and having to be deleted one by one, but the
+                    #     prefix query may require an expensive table scan so
+                    #     it's better to delete them as they are found by the
+                    #     read cursor? Would also need to refresh the read
+                    #     cursor so the deleted prefixed files are not found
+                    #     again
 
             # Done with this subdirpath, update the subdirpath date
             # XXX Note this is still called if the subdirpath was deleted,
