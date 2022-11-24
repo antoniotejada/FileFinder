@@ -68,15 +68,15 @@ fortunately some versions of Anaconda do support PyQt5 and 32-bit Windows XP.
 
 ## Running
 
-    filefinder.py [comma separated list of directories to collect]
+    filefinder.py [comma separated list of directories to collect] [database filepath]
 
 Eg on Windows, 
     
-    filefinder.py \windows\system32
+    filefinder.py \windows\system32 _out\files.db
 
 on Linux, 
     
-    ./filefinder.py ~/.mozilla,/etc
+    ./filefinder.py ~/.mozilla,/etc _out/files.db
 
 
 ## Features
@@ -88,6 +88,7 @@ on Linux,
   the table is scrolled to prevent QTableView building startup time)
 - Launch associated applications on doubleclick/enter
 - Copy all selected paths to clipboard on right click/ctrl+c
+- Copy/cut selected files to clipboard
 - Uses sqlite3 as database, smart updated in the background at app launch
 
 ## Requirements
@@ -116,4 +117,5 @@ on Linux,
 - Configuration file
 - Configuration UI
 - Store file-specific metadata (image sizes, video lengths...)
-- Open Everything data files?
+- Open Everything data files? (the database format looks private,
+  but it could open [.efu files](https://www.voidtools.com/support/everything/file_lists/), use the [SDK](https://www.voidtools.com/support/everything/sdk/) or use the command line tool [es.exe](https://www.voidtools.com/support/everything/command_line_interface/) (note the last two methods wouldn't be cross platform)

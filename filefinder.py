@@ -40,6 +40,7 @@ import os
 import sqlite3
 import stat
 import string
+import struct
 import sys
 
 
@@ -368,6 +369,26 @@ class TableModel(QAbstractTableModel):
                 #     time a new combination is found), makes the worst case
                 #     where all files are filtered out quite faster (from a
                 #     second on 600K files to ~instantaneous)
+                #     See 
+                #       select * from sqlite_master where type = 'index';
+                #     or 
+                #       PRAGMA index_list(table_name);
+                #     to check which indices or use create index if not exists
+                #     or create and ignore the error
+
+                
+                # XXX Note the number of column combinations to create indices
+                #     for can be reduced by half because inverted sorts use the
+                #     same index, eg both
+                #     - size DESC, path ASC, name ASC, mtime DESC 
+                #     - size ASC, path DESC, name DESC, mtime ASC
+                #     will use the size_desc_path_asc_name_asc_mtime_desc
+                #     index
+                # XXX To further reduce another option is to remove the n-last
+                #     columns in the index and let it sort manually for those,
+                #     expecting that the first m columns will have discarded
+                #     most of the data
+
                 filter_clauses.append("((path || \"" + os.sep + "\" || name) LIKE (\"%\" || ? || \"%\"))")
             filter_clause = " WHERE %s" % string.join(filter_clauses, " AND ")
 
@@ -375,6 +396,7 @@ class TableModel(QAbstractTableModel):
         order_clause = ""
         sort_sections = ["name", "path", "size", "mtime"]
         order_clauses = []
+        # XXX Pull the cleanup from the stash?
         for sort_section in reversed(self.sort_orders):
             sort_order = self.sort_orders[sort_section]
             order_clauses.append(" %s%s" % (sort_sections[sort_section],
@@ -470,19 +492,42 @@ class TableView(QTableView):
         super(TableView, self).__init__(*args, **kwargs)
 
         # XXX This interacts in a weird way with the lineedit, when return is
-        #     presed on the lineedit, the default application is launched, which is
-        #     weird UX-wise, use a keypressEvent instead or consume that one
+        #     presed on the lineedit, the default application is launched, which
+        #     is weird UX-wise, use a keypressEvent instead or consume that one
         #     in the lineEdit?
         self.openAct = QAction('Open', self, shortcut="return", triggered=self.launchSelectedFilepaths)
 
         # Override the default tableview copy action which only copies the
         # filename, with one that copies the full filepath
-        self.copyFilepathsAct = QAction('Copy Filepaths', self, shortcut="ctrl+c", triggered=self.copySelectedFilepaths)
+        self.copyFilepathsAct = QAction('Copy Filepaths', self, shortcut="ctrl+shift+c", triggered=self.copySelectedFilepaths)
+        
+        self.copyFilesAct = QAction('Copy', self, shortcut="ctrl+c", triggered=self.copySelectedFiles)
+        self.cutFilesAct = QAction('Cut', self, shortcut="ctrl+x", triggered=self.cutSelectedFiles)
+        
+        # XXX Allow paste into the current path? what if multiple selections,
+        #     copy to the focused line or do multiple copies?
         
         # XXX Adding the action to the TableView here won't be necessary if
-        # added to QMainWindow menubar
+        #     added to QMainWindow menubar
         self.addAction(self.openAct)
         self.addAction(self.copyFilepathsAct)
+        self.addAction(self.copyFilesAct)
+        self.addAction(self.cutFilesAct)
+
+    def getSelectedFilepaths(self):
+        filepaths = []
+        # XXX Could also do selectedRows(column)? (but that method doesn't seem
+        #     to be available?)
+        for ix in self.selectedIndexes():
+            # Note for each row there's a selection per column, only copy
+            # one filepath per row
+            if (ix.column() == 0):
+                filepath = self.model().getFilepath(ix)
+                filepaths.append(filepath)
+                
+                self.filepathCopied.emit(filepath)
+
+        return filepaths
 
     def launchWithPreferredApp(self, ix):
         
@@ -502,19 +547,46 @@ class TableView(QTableView):
                 self.launchWithPreferredApp(ix)
 
     def copySelectedFilepaths(self):
-        filepaths = []
-        # XXX Could also do selectedRows(column)? (but that method doesn't seem
-        #     to be available?)
-        for ix in self.selectedIndexes():
-            # Note for each row there's a selection per column, only copy
-            # one filepath per row
-            if (ix.column() == 0):
-                filepath = self.model().getFilepath(ix)
-                filepaths.append(filepath)
-                
-                self.filepathCopied.emit(filepath)
+        filepaths = self.getSelectedFilepaths()
+        logger.info("Copying filepaths %r", filepaths)
         clipboard = qApp.clipboard()
         clipboard.setText(string.join(filepaths, "\n"))
+
+    def cutCopySelectedFiles(self, cut = False):
+        # XXX Do something to gray out if cutting? (note the file doesn't really
+        #     get cut until copied elsewhere so there's no point in refreshing
+        #     the database here)
+        filepaths = self.getSelectedFilepaths()
+        logger.info("%s files %r", "Cutting" if cut else "Copying", filepaths)
+        urls = [QUrl.fromLocalFile(filepath) for filepath in filepaths]
+
+        mimeData = QMimeData()
+        mimeData.setUrls(urls)
+
+        if (cut):
+            # Copy is supported transparently by setUrls, but cut needs
+            # different support on Windows, KDE and Gnome
+            # Eg see https://github.com/lxqt/libfm-qt/blob/master/src/utilities.cpp#L128
+            
+            # Windows
+            # 2 is WinForms.DragDropEffects.Move
+            mimeData.setData("Preferred DropEffect", struct.pack("<I", 2))
+            # KDE
+            # XXX Untested
+            mimeData.setData("application/x-kde-cutselection", struct.pack("<I", 1))
+            # Gnome, LXDE, and XFCE
+            # Note url.toString() returns unicode but QByteArray won't take
+            # unicode, convert to utf-8
+            u = u"cut\n" + str.join("\n", [url.toString() for url in urls]) + "\n"
+            mimeData.setData("x-special/gnome-copied-files", QByteArray(u.encode("utf-8")))
+
+        qApp.clipboard().setMimeData(mimeData)
+
+    def copySelectedFiles(self):
+        self.cutCopySelectedFiles()
+
+    def cutSelectedFiles(self):
+        self.cutCopySelectedFiles(True)
         
     def contextMenuEvent(self, event):
         self.menu = QMenu(self)
@@ -526,6 +598,8 @@ class TableView(QTableView):
         #     without having to populate the table with them (needs access to
         #     the db from here?)
         self.menu.addAction(self.copyFilepathsAct)
+        self.menu.addAction(self.copyFilesAct)
+        self.menu.addAction(self.cutFilesAct)
 
         # XXX Add more actions like copying the selected files, cutting the
         #     selected files, and pasting into the destination row dirpath or
@@ -549,7 +623,7 @@ class MainWindow(QMainWindow):
     def __init__(self, parent = None):
         super(MainWindow, self).__init__(parent)
         self.resize(1000, 500)
-        self.setWindowTitle("FileFinder")
+        self.setWindowTitle("FileFinder - %s" % os.path.basename(database_filepath))
         wid = QWidget(self)
         self.setCentralWidget(wid)
 
@@ -1364,6 +1438,15 @@ def report_versions():
 
 
 def main():
+    global database_filepath
+    if (len(sys.argv) > 2):
+        database_filepath = sys.argv[2]
+
+    else:
+        database_filepath = os.path.join("_out", "files.db")
+
+    logger.info("Using database %r", database_filepath)
+    
     report_versions()
     
     verify_pyqt5_installation()
@@ -1418,9 +1501,9 @@ def main():
             CREATE INDEX idx_files_name ON files(name);
             CREATE INDEX idx_files_size ON files(size);
             CREATE INDEX idx_files_mtime ON files(mtime);
-            CREATE INDEX idx_files_path_name ON files(path, name);
-            CREATE INDEX idx_files_path_name_size_mtime ON files(path, name, size, mtime);
-            CREATE INDEX idx_files_size_path_name_mtime ON files(size, path, name, mtime);
+            CREATE INDEX idx_files_path_asc_name_asc ON files(path ASC, name ASC);
+            CREATE INDEX idx_files_path_asc_name_asc_size_desc_mtime_desc ON files(path ASC, name ASC, size DESC, mtime DESC);
+            CREATE INDEX idx_files_size_desc_path_asc_name_asc_mtime_desc ON files(size DESC, path ASC, name ASC, mtime DESC);
         """)
         conn.commit()
         conn.close()
